@@ -119,6 +119,10 @@ async fn read_file(originals: Originals, backend: Option<Backend>, file: web_sys
 
 /// Show the browser's open dialog; picked files are imported asynchronously.
 fn open_picker(originals: Originals, backend: Option<Backend>, ctx: egui::Context) {
+    if window().and_then(|w| w.location().search().ok()).is_some_and(|q| q.contains("lensflow=1")) {
+        notice("Choose originals in the LensFlow asset library before opening this workspace. This keeps every photo backed up.");
+        return;
+    }
     let Some(doc) = window().and_then(|w| w.document()) else { return };
     let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else { return };
     input.set_type("file");
@@ -401,7 +405,8 @@ impl WebApp {
             on_disk: false,
         };
         let mut problem = None;
-        match session.open_library_in(stores, true).cloned() {
+        let portal = window().and_then(|w| w.location().search().ok()).is_some_and(|q| q.contains("lensflow=1"));
+        match session.open_library_in(stores, !portal).cloned() {
             Ok(r) => log::info!(
                 "lightcraft: library {} in {:.0} ms ({} photos; snapshot seq {}, {} ops replayed)",
                 if r.created { "created" } else { "loaded" },
@@ -482,6 +487,10 @@ impl WebApp {
 
     fn import_dropped(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() && window().and_then(|w| w.location().search().ok()).is_some_and(|q| q.contains("lensflow=1")) {
+            notice("Add photos to LensFlow first, then open them in an editing workspace so the originals remain backed up.");
+            return;
+        }
         for f in dropped {
             let (originals, backend, ctx) = (self.originals.clone(), self.backend.clone(), ctx.clone());
             wasm_bindgen_futures::spawn_local(async move {
@@ -574,10 +583,22 @@ impl WebApp {
 
 type Reply = (js_sys::Function, js_sys::Function);
 
+type PortalRequest = (String, String, Vec<u8>, Reply);
+
 thread_local! {
     /// Commands from JavaScript ([`command`]), run on the next frame.
     static INBOX: std::cell::RefCell<Vec<(String, String, Reply)>> = const { std::cell::RefCell::new(Vec::new()) };
     static CTX: std::cell::RefCell<Option<egui::Context>> = const { std::cell::RefCell::new(None) };
+    static PORTAL_INBOX: std::cell::RefCell<Vec<PortalRequest>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// LensFlow transfers selected bytes, never an admin credential, into this isolated workspace.
+#[wasm_bindgen]
+pub fn lensflow_request(action: String, params: String, bytes: Vec<u8>) -> js_sys::Promise {
+    js_sys::Promise::new(&mut |resolve, reject| {
+        PORTAL_INBOX.with(|q| q.borrow_mut().push((action.clone(), params.clone(), bytes.clone(), (resolve, reject))));
+        request_repaint();
+    })
 }
 
 /// Run a command by id from JavaScript (automation, tests): `await command("library.info", "{}")`
@@ -592,6 +613,97 @@ pub fn command(id: String, params: String) -> js_sys::Promise {
 }
 
 impl WebApp {
+    fn portal_request(&mut self, action: &str, params: &str, bytes: &[u8]) -> Result<JsValue, String> {
+        let params: serde_json::Value = serde_json::from_str(params).map_err(|e| e.to_string())?;
+        match action {
+            "open" => {
+                if bytes.len() > 256 * 1024 * 1024 {
+                    return Err("This original exceeds the 256 MB workspace limit".into());
+                }
+                let hash = content_hash(bytes);
+                let path = crate::store::original_path(&hash, params["name"].as_str().unwrap_or("photo.jpg"));
+                self.originals.insert(&hash, Arc::from(bytes));
+                self.app.run("library.import", json!({"paths": [path]}))?;
+                Ok(JsValue::NULL)
+            }
+            "restore" => {
+                let state: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+                if state["format"] != "lensflow-lightcraft-1" {
+                    return Err("Unsupported LightCraft project version".into());
+                }
+                let files = Files::default();
+                let saved = state["files"].as_object().ok_or("Missing project files")?;
+                for (name, value) in saved {
+                    if !LIBRARY_FILES.contains(&name.as_str()) {
+                        return Err("Unknown library file".into());
+                    }
+                    files.preload(name, value.as_str().ok_or("Invalid library file")?.as_bytes().to_vec());
+                }
+                self.app
+                    .session
+                    .open_library_in(
+                        LibraryStores { dir: "lensflow".into(), catalog: Box::new(files.store()), files: Box::new(files.store()), on_disk: false },
+                        false,
+                    )
+                    .map_err(|e| e.to_string())?;
+                self.files = files;
+                self.app.renderer.forget_all();
+                Ok(JsValue::NULL)
+            }
+            "status" => {
+                let mut bytes = self.files.get("catalog.snap").unwrap_or_default();
+                bytes.extend(self.files.get("catalog.log").unwrap_or_default());
+                bytes.extend(self.files.get("presets.json").unwrap_or_default());
+                Ok(json!({"revision": content_hash(&bytes), "photos": self.app.session.catalog.len()}).to_string().into())
+            }
+            "snapshot" => {
+                self.app.session.save_view();
+                self.app.session.save_prefs().map_err(|e| e.to_string())?;
+                let files: serde_json::Map<String, serde_json::Value> = LIBRARY_FILES
+                    .iter()
+                    .filter_map(|name| self.files.get(name).map(|data| (name.to_string(), json!(String::from_utf8_lossy(&data)))))
+                    .collect();
+                let encoded =
+                    serde_json::to_vec(&json!({"format": "lensflow-lightcraft-1", "files": files, "sources": []})).map_err(|e| e.to_string())?;
+                let result = js_sys::Object::new();
+                js_sys::Reflect::set(&result, &"bytes".into(), &js_sys::Uint8Array::from(encoded.as_slice())).map_err(|e| format!("{e:?}"))?;
+                let mut revision = self.files.get("catalog.snap").unwrap_or_default();
+                revision.extend(self.files.get("catalog.log").unwrap_or_default());
+                revision.extend(self.files.get("presets.json").unwrap_or_default());
+                js_sys::Reflect::set(&result, &"revision".into(), &JsValue::from_str(&content_hash(&revision))).map_err(|e| format!("{e:?}"))?;
+                Ok(result.into())
+            }
+            "export" => {
+                let id = params["id"]
+                    .as_u64()
+                    .map(lightcraft_engine::catalog::PhotoId)
+                    .or(self.app.session.selection.active)
+                    .ok_or("Select a photo to export")?;
+                let exported =
+                    lightcraft_engine::export::export_photo(&mut self.app.session, id, &lightcraft_engine::export::ExportOptions::default(), 1)?;
+                let result = js_sys::Object::new();
+                js_sys::Reflect::set(&result, &"bytes".into(), &js_sys::Uint8Array::from(exported.bytes.as_slice())).map_err(|e| format!("{e:?}"))?;
+                js_sys::Reflect::set(&result, &"name".into(), &JsValue::from_str(&exported.file_name)).map_err(|e| format!("{e:?}"))?;
+                Ok(result.into())
+            }
+            "acknowledge" => Ok(JsValue::NULL),
+            "command" => self.app.run(params["id"].as_str().ok_or("Missing command")?, params["params"].clone()).map(|v| v.to_string().into()),
+            _ => Err("Unknown LensFlow operation".into()),
+        }
+    }
+
+    fn run_portal_inbox(&mut self) {
+        for (action, params, bytes, (resolve, reject)) in PORTAL_INBOX.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+            match self.portal_request(&action, &params, &bytes) {
+                Ok(value) => {
+                    let _ = resolve.call1(&JsValue::NULL, &value);
+                }
+                Err(error) => {
+                    let _ = reject.call1(&JsValue::NULL, &error.into());
+                }
+            }
+        }
+    }
     fn web_stats(&self) -> serde_json::Value {
         let (alive, ready, remote, inline) = self.workers.as_ref().map_or((0, 0, 0, 0), Workers::stats);
         let (orig_n, orig_bytes) = self.originals.usage();
@@ -630,6 +742,7 @@ impl eframe::App for WebApp {
             self.app.ui.toast = Some((text, now + NOTICE_SECS, None));
         }
         self.run_inbox();
+        self.run_portal_inbox();
         self.import_dropped(ctx);
         self.load_originals(ctx);
         if let Some(w) = &self.workers {
